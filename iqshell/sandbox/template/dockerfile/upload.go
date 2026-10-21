@@ -53,62 +53,41 @@ func ComputeFilesHash(src, dest, contextPath string, ignorePatterns []string) (s
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// CollectAndUpload 收集源文件，通过流式方式创建 gzip tar 归档包并上传到指定 URL。
-// 使用 io.Pipe 避免将整个归档加载到内存中。
+// CollectAndUpload 收集源文件，创建 gzip tar 归档包并上传到指定 URL。
+// 归档先写入临时文件，上传时带上 Content-Length：
+// 部分 S3 兼容存储不接受分块传输编码（chunked）的预签名 PUT。
 func CollectAndUpload(ctx context.Context, uploadURL, src, contextPath string, ignorePatterns []string) error {
 	files, err := collectFiles(src, contextPath, ignorePatterns)
 	if err != nil {
 		return fmt.Errorf("collect files: %w", err)
 	}
 
-	// 使用 io.Pipe 流式创建 tar.gz 并直接上传
-	pr, pw := io.Pipe()
-
-	go func() {
-		gw := gzip.NewWriter(pw)
-		tw := tar.NewWriter(gw)
-
-		var writeErr error
-		for _, f := range files {
-			header, err := tar.FileInfoHeader(f.info, "")
-			if err != nil {
-				writeErr = fmt.Errorf("create tar header for %s: %w", f.relPath, err)
-				break
-			}
-			header.Name = f.relPath
-
-			if err := tw.WriteHeader(header); err != nil {
-				writeErr = fmt.Errorf("write tar header for %s: %w", f.relPath, err)
-				break
-			}
-
-			file, err := os.Open(f.absPath)
-			if err != nil {
-				writeErr = fmt.Errorf("open file %s: %w", f.absPath, err)
-				break
-			}
-			_, err = io.Copy(tw, file)
-			file.Close()
-			if err != nil {
-				writeErr = fmt.Errorf("write file %s to tar: %w", f.relPath, err)
-				break
-			}
-		}
-
-		tw.Close()
-		gw.Close()
-		if writeErr != nil {
-			pw.CloseWithError(writeErr)
-		} else {
-			pw.Close()
-		}
+	archive, err := os.CreateTemp("", "qshell-copy-*.tar.gz")
+	if err != nil {
+		return fmt.Errorf("create archive file: %w", err)
+	}
+	defer func() {
+		archive.Close()
+		os.Remove(archive.Name())
 	}()
 
+	if err := writeArchive(archive, files); err != nil {
+		return err
+	}
+	size, err := archive.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("get archive size: %w", err)
+	}
+	if _, err := archive.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind archive: %w", err)
+	}
+
 	// 通过 PUT 上传
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, archive)
 	if err != nil {
 		return fmt.Errorf("create upload request: %w", err)
 	}
+	req.ContentLength = size
 	req.Header.Set("Content-Type", "application/gzip")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -120,6 +99,43 @@ func CollectAndUpload(ctx context.Context, uploadURL, src, contextPath string, i
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// writeArchive 将文件写为 gzip tar 归档。
+func writeArchive(w io.Writer, files []fileEntry) error {
+	gw := gzip.NewWriter(w)
+	tw := tar.NewWriter(gw)
+
+	for _, f := range files {
+		header, err := tar.FileInfoHeader(f.info, "")
+		if err != nil {
+			return fmt.Errorf("create tar header for %s: %w", f.relPath, err)
+		}
+		header.Name = f.relPath
+
+		if err := tw.WriteHeader(header); err != nil {
+			return fmt.Errorf("write tar header for %s: %w", f.relPath, err)
+		}
+
+		file, err := os.Open(f.absPath)
+		if err != nil {
+			return fmt.Errorf("open file %s: %w", f.absPath, err)
+		}
+		_, err = io.Copy(tw, file)
+		file.Close()
+		if err != nil {
+			return fmt.Errorf("write file %s to tar: %w", f.relPath, err)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("close tar archive: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		return fmt.Errorf("close gzip archive: %w", err)
 	}
 
 	return nil

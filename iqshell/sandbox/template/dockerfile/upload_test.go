@@ -1,7 +1,11 @@
 package dockerfile
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,6 +68,19 @@ func TestCollectAndUpload(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPut, r.Method)
 		assert.Equal(t, "application/gzip", r.Header.Get("Content-Type"))
+		// 部分 S3 兼容存储拒绝 chunked 的预签名 PUT，请求须带长度
+		assert.Empty(t, r.TransferEncoding)
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(len(body)), r.ContentLength)
+
+		gr, err := gzip.NewReader(bytes.NewReader(body))
+		if assert.NoError(t, err) {
+			header, err := tar.NewReader(gr).Next()
+			if assert.NoError(t, err) {
+				assert.Equal(t, "file.txt", header.Name)
+			}
+		}
 		received = true
 		w.WriteHeader(http.StatusOK)
 	}))
